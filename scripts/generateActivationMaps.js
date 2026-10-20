@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { fileURLToPath } from "url";
 
 const SKILLS_PATH = path.resolve("assets", "skill.json");
 const START_SKILL = "Introduction to Physiology";
@@ -21,6 +22,7 @@ function collectTexts(skill) {
   if (Array.isArray(skill.preconditions)) texts.push(...flattenTexts(skill.preconditions));
   if (Array.isArray(skill.effect)) {
     for (const effect of skill.effect) {
+      if (Array.isArray(effect.preconditions)) texts.push(...flattenTexts(effect.preconditions));
       if (Array.isArray(effect.conditions)) texts.push(...effect.conditions);
       if (effect.description) texts.push(effect.description);
     }
@@ -48,29 +50,36 @@ function extractRemainingDistanceMeters(text) {
   return null;
 }
 
-function buildActivationMapForSkill(skill) {
+export function buildActivationMapForSkill(skill) {
   const texts = collectTexts(skill);
   const allText = texts.join(" | ");
   const triggers = [];
-  const requirements = {};
+  const courseFields = {};
 
+  const distanceTypes = [];
   if (/\b(sprint|mile|medium|long)\b/.test(allText)) {
-    const distanceTypes = new Set();
+    const found = new Set();
     for (const t of texts) {
       const m = t.match(/\b(sprint|mile|medium|long)\b/g) ?? [];
-      for (const item of m) distanceTypes.add(item);
+      for (const item of m) found.add(item);
     }
-    if (distanceTypes.size) requirements.distance_types = [...distanceTypes];
+    distanceTypes.push(...found);
   }
+  if (distanceTypes.length) courseFields.distance_types = distanceTypes;
 
-  if (allText.includes("turf")) requirements.terrains = ["turf"];
-  if (allText.includes("dirt")) requirements.terrains = ["dirt"];
+  const terrains = [];
+  if (allText.includes("turf")) terrains.push("turf");
+  if (allText.includes("dirt")) terrains.push("dirt");
+  if (terrains.length) courseFields.terrains = terrains;
+
+  const directions = [];
   if (allText.includes("counterclockwise") || allText.includes("left-handed") || allText.includes("left handed")) {
-    requirements.directions = ["counterclockwise"];
+    directions.push("counterclockwise");
   }
-  if (allText.includes("clockwise") || allText.includes("right-handed") || allText.includes("right handed")) {
-    requirements.directions = ["clockwise"];
+  if (/\bclockwise\b/.test(allText) || allText.includes("right-handed") || allText.includes("right handed")) {
+    directions.push("clockwise");
   }
+  if (directions.length) courseFields.directions = directions;
 
   // Final corner == last corner in map, regardless of corner number.
   if (allText.includes("final corner")) {
@@ -154,14 +163,18 @@ function buildActivationMapForSkill(skill) {
     return null;
   }
 
-  const activationMap = {
+  if (Object.keys(courseFields).length > 0) {
+    for (const trigger of triggers) {
+      for (const [key, value] of Object.entries(courseFields)) {
+        if (trigger[key] == null) trigger[key] = value;
+      }
+    }
+  }
+
+  return {
     show_chart: true,
     triggers,
   };
-  if (Object.keys(requirements).length > 0) {
-    activationMap.requirements = requirements;
-  }
-  return activationMap;
 }
 
 async function main() {
@@ -192,7 +205,12 @@ async function main() {
   console.log(`Generated activation_map for ${changed} skills (starting from "${START_SKILL}").`);
 }
 
-main().catch((error) => {
-  console.error(error.message || error);
-  process.exit(1);
-});
+const isDirect = process.argv[1]
+  && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+
+if (isDirect) {
+  main().catch((error) => {
+    console.error(error.message || error);
+    process.exit(1);
+  });
+}

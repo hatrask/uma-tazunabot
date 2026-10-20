@@ -108,12 +108,6 @@ export async function InstallGuildCommands(appId, guildId, commands) {
   }
 }
 
-// Simple method that returns a random emoji from list
-export function getRandomEmoji() {
-  const emojiList = ['😭','😄','😌','🤓','😎','😤','🤖','😶‍🌫️','🌏','📸','💿','👋','🌊','✨'];
-  return emojiList[Math.floor(Math.random() * emojiList.length)];
-}
-
 export function capitalize(str) {
   return str.charAt(0).toUpperCase() + str.slice(1);
 }
@@ -303,13 +297,40 @@ export function getCardColor(str)
   }
 }
 
-// Returns Color for the Skills Embed
+const SKILL_CATEGORY_COLORS = {
+  speed: "green",
+  stamina: "green",
+  power: "green",
+  guts: "green",
+  wit: "green",
+  gate: "green",
+  super7: "green",
+  recovery: "blue",
+  velocity: "yellow",
+  accel: "yellow",
+  flow: "yellow",
+  focus: "yellow",
+  vision: "red",
+  frenzy: "red",
+  runaway: "green",
+};
+
+function baseSkillCategory(category) {
+  let key = String(category ?? "").toLowerCase();
+  for (const prefix of ["golden", "rainbow", "evo"]) {
+    if (key.startsWith(prefix) && key.length > prefix.length) {
+      key = key.slice(prefix.length);
+      break;
+    }
+  }
+  return key;
+}
+
+// Returns Color for the Skills Embed. Golden, rainbow, and evolved variants use the base category color.
 export function getSkillColor(str)
 {
-  if (str === 'speed')
-  {
-    return getColor('green');
-  }
+  const colorName = SKILL_CATEGORY_COLORS[baseSkillCategory(str)];
+  return colorName ? getColor(colorName) : undefined;
 }
 
 // Get Gametora's thumbnail for the skill
@@ -544,6 +565,11 @@ export function getSkillThumbnail(str)
   {
     return 'https://gametora.com/images/umamusume/skill_icons/utx_ico_skill_40012.png';
   }
+
+  const base = baseSkillCategory(str);
+  if (base && base !== String(str ?? "").toLowerCase()) {
+    return getSkillThumbnail(base);
+  }
 }
 
 export function formatCardSkill(skillName, skillsJSON)
@@ -765,40 +791,77 @@ function isGroupedPreconditions(preconditions) {
     && preconditions.every((entry) => Array.isArray(entry));
 }
 
+function preconditionLines(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry) => entry != null && entry !== "" && !Array.isArray(entry));
+}
+
+function preconditionsForEffect(skill, effect, index) {
+  if (Array.isArray(effect?.preconditions)) return preconditionLines(effect.preconditions);
+
+  const shared = skill?.preconditions;
+  if (!Array.isArray(shared) || shared.length === 0) return [];
+  if (isGroupedPreconditions(shared)) return preconditionLines(shared[index]);
+  return preconditionLines(shared);
+}
+
 function formatConditionLines(items) {
   return items.map((item) => `- ${item}`).join("\n");
 }
 
+function formatRequirementEntry(entry) {
+  const description = entry?.description ?? entry;
+  const options = (Array.isArray(description) ? description : [description])
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean);
+  if (options.length === 0) return "";
+  if (options.length === 1) return options[0];
+  return `${options[0]}\n${options.slice(1).map((option) => `**or** ${option}`).join("\n")}`;
+}
+
+function evolutionNamesForSkill(skill) {
+  const raw = skill?.evolutions;
+  const names = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  return names.filter((name) => name && name !== skill?.upgrade);
+}
+
+export function evolvedSkillNamesForUma(uma, skills) {
+  if (!uma || !Array.isArray(skills)) return [];
+  const horse = `${uma.character_name} (${uma.type})`;
+  return skills
+    .filter((skill) => String(skill?.rarity ?? "").toLowerCase() === "evo" && skill.horse === horse)
+    .map((skill) => skill.skill_name);
+}
+
+function formatSkillRequirements(requirements) {
+  if (!Array.isArray(requirements) || requirements.length === 0) return "";
+  return requirements
+    .map((entry, index) => {
+      const text = formatRequirementEntry(entry);
+      return text ? `**${index + 1}.** ${text}` : "";
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 export function buildSkillEmbed(skill, supporterList) {
   const fields = [];
-  const groupedPreconditions = isGroupedPreconditions(skill.preconditions);
-
-  // A single shared precondition list is shown once. Multiple lists are paired
-  // with each effect (precondition 1 with effect 1, and so on).
-  if (!groupedPreconditions && skill.preconditions && skill.preconditions.length > 0) {
-    fields.push({
-      name: "Preconditions",
-      value: formatConditionLines(skill.preconditions) + "\n\u200B",
-      inline: false
-    });
-  }
 
   // ===== Effects =====
   if (skill.effect && skill.effect.length > 0) {
     skill.effect.forEach((effect, index) => {
       let value = "";
-      const effectPreconditions = groupedPreconditions ? skill.preconditions[index] : null;
+      const effectPreconditions = preconditionsForEffect(skill, effect, index);
 
-      if (Array.isArray(effectPreconditions) && effectPreconditions.length > 0) {
-        value += `**Preconditions:**\n${formatConditionLines(effectPreconditions)}\n\n`;
-      }
-
-      // Conditions
       if (effect.conditions && effect.conditions.length > 0) {
         value += effect.conditions.map(c => `- ${c}`).join("\n");
       }
 
-      // Effect description
+      if (effectPreconditions.length > 0) {
+        if (value) value += "\n\n";
+        value += `**Preconditions:**\n${formatConditionLines(effectPreconditions)}`;
+      }
+
       value += `\n\n**Effect:**\n${effect.description}`;
 
       if (effect.scale) {
@@ -818,9 +881,18 @@ export function buildSkillEmbed(skill, supporterList) {
     });
   }
 
+  const requirementText = formatSkillRequirements(skill.requirements);
+  if (requirementText) {
+    fields.push({
+      name: "Requirements",
+      value: requirementText + "\n\u200B",
+      inline: false
+    });
+  }
+
   if (skill.horse) {
     fields.push({
-      name: "Inherited from",
+      name: String(skill.rarity).toLowerCase() === "evo" ? "Available On" : "Inherited from",
       value: skill.horse,
       inline: false
     });
@@ -906,6 +978,27 @@ export function buildSkillComponents(skill, includeDropdown = false, supporters,
     });
   }
 
+  const evolutionNames = evolutionNamesForSkill(skill);
+  if (evolutionNames.length > 0) {
+    const customId = mapOverrideKey
+      ? `skill_evolution_select::${mapOverrideKey}`.slice(0, 100)
+      : "skill_evolution_select";
+    rows.push({
+      type: 1,
+      components: [
+        {
+          type: 3,
+          custom_id: customId,
+          placeholder: "Select an evolution",
+          options: evolutionNames.slice(0, 25).map((name) => ({
+            label: truncate(name, 100),
+            value: truncate(name, 100),
+          }))
+        }
+      ]
+    });
+  }
+
   const umalatorUrl = buildUmalatorSkillVisualizerUrl(mapCid, skill.gametora_id);
   if (umalatorUrl) {
     buttonComponents.push({
@@ -916,11 +1009,10 @@ export function buildSkillComponents(skill, includeDropdown = false, supporters,
     });
   }
 
-  // Only push row if buttons exist
-  if (buttonComponents.length > 0) {
+  while (buttonComponents.length > 0) {
     rows.push({
       type: 1,
-      components: buttonComponents
+      components: buttonComponents.splice(0, 5)
     });
   }
 
@@ -1043,6 +1135,15 @@ export function buildUmaEmbed(uma, skills) {
         value: uma.event_skills?.length ? uma.event_skills.map(e => formatCardSkill(e, skills)).join("\n ") : "—",
         inline: true
       },
+      ...(() => {
+        const evolved = evolvedSkillNamesForUma(uma, skills);
+        if (!evolved.length) return [];
+        return [{
+          name: "Evolved Skills",
+          value: evolved.map((name) => formatCardSkill(name, skills)).join("\n ") + "\n \u200B",
+          inline: false
+        }];
+      })(),
       ...(uma.secrets?.length
         ? [
             {
@@ -1059,7 +1160,7 @@ export function buildUmaEmbed(uma, skills) {
   };
 }
 
-export function buildUmaComponents(uma, includeDropdown = false, charactersJSON) {
+export function buildUmaComponents(uma, includeDropdown = false, charactersJSON, skills = []) {
   const rows = [];
 
   // 🔎 Find variants by character_name
@@ -1083,9 +1184,10 @@ export function buildUmaComponents(uma, includeDropdown = false, charactersJSON)
     });
   }
 
-  // Collect all skills
+  // Unique first, then evolved skills, then the rest of the kit.
   const allSkills = [
     ...(uma.unique ? [uma.unique] : []),
+    ...evolvedSkillNamesForUma(uma, skills),
     ...(uma.skills || []),
     ...(uma.potential || []),
     ...(uma.event_skills || [])

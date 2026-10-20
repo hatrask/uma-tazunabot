@@ -86,9 +86,11 @@ import { reloadEventsFromDisk } from './eventService.js';
 import { resumeActiveQuizzes } from './quizRunner.js';
 import { startQuizRemoteSync } from './quizStorage.js';
 import {
+  applyScheduleCmDate,
   buildScheduleAutocompleteChoices,
   getCurrentMonthEventById,
   getCurrentMonthSchedule,
+  listScheduleEvents,
 } from './scheduleService.js';
 import {
   buildGuideAutocompleteChoices,
@@ -477,6 +479,16 @@ function parseSchedulePickupValue(rawValue) {
   return { eventId, kind, pickupId };
 }
 
+async function datedChampionsMeets() {
+  try {
+    const events = await listScheduleEvents();
+    return champsmeets.map((cm) => applyScheduleCmDate(cm, events));
+  } catch (err) {
+    console.warn('[CM] Could not load schedule dates:', err.message);
+    return champsmeets;
+  }
+}
+
 function normalizeSkillMapOptions(options) {
   if (options == null) return {};
   if (typeof options === 'number') return { selectedCmNumber: options };
@@ -528,10 +540,11 @@ async function buildSkillEmbedWithMap(skill, supporterList, req, options = {}) {
     mapContextKey = override.key;
     result.mapCid = override.rawMap?.cid ?? null;
   } else {
-    const upcomingCm = getUpcomingChampionsMeet(champsmeets);
+    const datedCms = await datedChampionsMeets();
+    const upcomingCm = getUpcomingChampionsMeet(datedCms);
     const { min: skillCmMin, max: skillCmMax } = getSkillCmRange();
 
-    const selectableCms = getSelectableChampionsMeets(champsmeets, {
+    const selectableCms = getSelectableChampionsMeets(datedCms, {
       fromCmNumber: skillCmMin,
       maxCmNumber: skillCmMax,
       mapsCatalog: cache.maps,
@@ -937,19 +950,26 @@ app.post('/interactions', verifyKeyMiddleware(PUBLIC_KEY), async function (req, 
       });
 
       (async () => {
+        let eventNote = '';
+        try {
+          const loaded = reloadEventsFromDisk();
+          eventNote = `${loaded.length} gamba events loaded.`;
+        } catch (err) {
+          console.error('Gamba event reload failed:', err);
+          eventNote = `Gamba events failed to reload: ${String(err?.message || err).slice(0, 120)}`;
+        }
         try {
           await updateCache();
-          reloadEventsFromDisk();
           await sendFollowup(token, {
             flags: InteractionResponseFlags.EPHEMERAL,
-            content: '✅ Cache refreshed. Event JSON definitions reloaded — use `/gamba event refresh` to push odds changes.',
+            content: `✅ Cache refreshed. ${eventNote} Use \`/gamba event refresh\` to push odds changes.`,
           });
         } catch (err) {
           console.error('Manual cache refresh failed:', err);
           const detail = String(err?.message || err).slice(0, 180);
           await sendFollowup(token, {
             flags: InteractionResponseFlags.EPHEMERAL,
-            content: `❌ Cache refresh failed.\n\`${detail}\``
+            content: `❌ Asset cache refresh failed.\n\`${detail}\`\n${eventNote}`
           });
         }
       })();
@@ -1129,7 +1149,7 @@ app.post('/interactions', verifyKeyMiddleware(PUBLIC_KEY), async function (req, 
           type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
           data: { 
             embeds: [buildUmaEmbed(matches[0], skills)],
-            components: buildUmaComponents(matches[0], true, characters)
+            components: buildUmaComponents(matches[0], true, characters, skills)
           }
         });
       }
@@ -1284,9 +1304,10 @@ app.post('/interactions', verifyKeyMiddleware(PUBLIC_KEY), async function (req, 
     // "cm" command
     if (name === 'cm') {
       const cupQuery = data.options?.find(opt => opt.name === "name")?.value?.toLowerCase();
+      const datedCms = await datedChampionsMeets();
 
       // Find matches
-      const matches = champsmeets.filter(c => {
+      const matches = datedCms.filter(c => {
         if (!cupQuery) return true;
 
         return (
@@ -2356,6 +2377,45 @@ app.post('/interactions', verifyKeyMiddleware(PUBLIC_KEY), async function (req, 
           });
     }
 
+    if (custom_id === "skill_evolution_select" || custom_id.startsWith("skill_evolution_select::")) {
+      const mapOverrideKey = custom_id.startsWith("skill_evolution_select::")
+        ? custom_id.slice("skill_evolution_select::".length)
+        : null;
+      const selectedName = String(values?.[0] ?? "");
+      const targetSkill = skills.find(s =>
+        s.skill_name.toLowerCase() === selectedName.toLowerCase()
+      );
+
+      if (!targetSkill) {
+        return res.send({
+          type: InteractionResponseType.UPDATE_MESSAGE,
+          data: { content: `⚠️ Evolved skill not found!` }
+        });
+      }
+
+      const supporterMatches = getSupporterMatchesForSkill(targetSkill.skill_name);
+      const supporterList = supporterMatches.length
+        ? supporterMatches.map(s => `• ${s.character_name} - ${s.card_name} (${s.rarity.toUpperCase()})`).join('\n')
+        : 'None';
+
+      const { embed: skillEmbed, mapComponents, mapOverrideKey: nextMapOverrideKey, mapCid } = await buildSkillEmbedWithMap(
+        targetSkill,
+        supporterList,
+        req,
+        { mapOverride: mapOverrideKey }
+      );
+      return res.send({
+        type: InteractionResponseType.UPDATE_MESSAGE,
+        data: {
+          embeds: [skillEmbed],
+          components: composeSkillComponents(
+            buildSkillComponents(targetSkill, supporterMatches.length, supporterMatches, nextMapOverrideKey, mapCid),
+            mapComponents
+          )
+        }
+      });
+    }
+
     // Handling looking up the upgraded/downgraded skill
     if (custom_id.startsWith("upgrade_") || custom_id.startsWith("downgrade_")) {
       const parsed = parseSkillNavCustomId(custom_id);
@@ -2411,7 +2471,7 @@ app.post('/interactions', verifyKeyMiddleware(PUBLIC_KEY), async function (req, 
         data: {
           content: `✅ You selected **${uma.character_name} (${uma.type})**`,
           embeds: [buildUmaEmbed(uma, skills)],
-          components: buildUmaComponents(uma, true, characters)
+          components: buildUmaComponents(uma, true, characters, skills)
         }
       });
     }
@@ -2431,7 +2491,7 @@ app.post('/interactions', verifyKeyMiddleware(PUBLIC_KEY), async function (req, 
         type: InteractionResponseType.UPDATE_MESSAGE, // update the same message
         data: {
           embeds: [buildUmaEmbed(variant, skills)],
-          components: buildUmaComponents(variant, true, characters)
+          components: buildUmaComponents(variant, true, characters, skills)
         }
       });
     }
@@ -2469,7 +2529,7 @@ app.post('/interactions', verifyKeyMiddleware(PUBLIC_KEY), async function (req, 
           content: `✅ You selected **${skill.skill_name}**`,
           embeds: [buildUmaEmbed(uma, skills), skillEmbed],
           components: [
-            ...buildUmaComponents(uma, true, characters),
+            ...buildUmaComponents(uma, true, characters, skills),
             ...buildSkillComponents(skill, supporterMatches.length, supporterMatches, null, mapCid)
           ]
         }
@@ -2634,7 +2694,8 @@ app.post('/interactions', verifyKeyMiddleware(PUBLIC_KEY), async function (req, 
 
     if (custom_id === "cm_select") {
       const selectedId = values[0];
-      const cm = champsmeets.find(c => c.name === selectedId);
+      const datedCms = await datedChampionsMeets();
+      const cm = datedCms.find(c => c.name === selectedId);
 
       if (!cm) {
         return res.send({

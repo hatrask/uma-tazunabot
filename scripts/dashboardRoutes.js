@@ -2,54 +2,51 @@ import fs from 'fs';
 import path from 'path';
 import express from 'express';
 import { fileURLToPath } from 'url';
+import { DiscordRequest } from './utils.js';
 import {
   applicationToDashboard,
   createApplication,
   deleteApplication,
   findGuildApplicationByUmaId,
+  getApplicationChannel,
   listGuildApplications,
   newApplicationId,
   patchApplication,
 } from './applicationStorage.js';
-import { isPremiumGuild } from './clubDatabase.js';
+import { isPremiumGuild, listRegisteredGuildIds, updateGuildClubSettings, getAllLeaderboardChannels } from './clubDatabase.js';
 import {
   addBlacklist,
   addStaffExtra,
-  clearTournamentPick,
   confirmPlanning,
-  createTournament,
   deleteBlacklist,
-  deleteTournament,
   findBlacklistMatch,
   getMembersCache,
   getPlanning,
   getSite,
-  getTournamentBoard,
   listBlacklist,
   listMemberDirectory,
   listMemberLinks,
   listPublicTenants,
   listStaffExtra,
-  listTournaments,
-  listTournamentsForUser,
   removeStaffExtra,
-  replaceTournamentRoster,
   resolveGuildRef,
   savePlanning,
   saveSite,
-  saveTournamentPick,
   seedClubSettings,
+  setClubOrder,
   setMembersCache,
-  updateTournament,
   upsertClubSettings,
   upsertMemberLink,
 } from './dashboardStore.js';
 import {
+  applyDynamicDailyTargets,
+  attachPromotionTargets,
   cacheTtlMs,
   buildPublicClub,
   hydrateClubTargets,
   listGuildDashboardClubs,
   resolveUmaProfile,
+  withPlannedMemberCounts,
 } from './dashboardUma.js';
 import {
   clearSessionCookie,
@@ -63,6 +60,9 @@ import {
   signSession,
   siteUrl,
 } from './dashboardAuth.js';
+import { mountAdmin } from './adminRoutes.js';
+import { buildMemberProfile, warmNetworkTenure } from './clubTenure.js';
+import { isDiscordWebhookUrl, notifyApplicationWebhook } from './applyNotify.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,9 +71,56 @@ function tenantFromReq(req) {
   return resolveGuildRef(req.query.guild || req.headers['x-tazuna-guild'] || req.body?.guild);
 }
 
+function publicSite(site) {
+  if (!site || typeof site !== 'object') return site;
+  const next = { ...site };
+  delete next.applyWebhookUrl;
+  return next;
+}
+
+function withLeaderboardChannels(guildId, clubs) {
+  const channels = getAllLeaderboardChannels().filter((entry) => String(entry.guildId) === String(guildId));
+  return clubs.map((club) => ({
+    ...club,
+    leaderboardChannelId: channels.find((entry) => String(entry.circleId) === String(club.circleId))?.channelId || null,
+  }));
+}
+
 function tenantPath(guildId) {
   const site = getSite(guildId);
   return `/g/${site.slug || guildId}`;
+}
+
+const GENERIC_SITE_NAMES = new Set([
+  'Tazuna Clubs',
+  'Tazuna Club',
+  'Bunny clubs',
+  'Bunny Clubs',
+  'Club network',
+]);
+
+function genericSiteName(name) {
+  const value = String(name || '').trim();
+  return !value || GENERIC_SITE_NAMES.has(value);
+}
+
+function tenantLabel(siteName, guildName, slug) {
+  const name = String(siteName || '').trim();
+  if (name && !GENERIC_SITE_NAMES.has(name)) return name;
+  if (guildName) return guildName;
+  return slug || name || 'Club network';
+}
+
+async function lookupGuildName(guildId) {
+  const stored = getApplicationChannel(guildId)?.guildName;
+  if (stored && stored !== 'this server') return stored;
+  try {
+    const res = await DiscordRequest(`guilds/${guildId}`, { method: 'GET' });
+    const guild = await res.json();
+    return guild?.name || null;
+  } catch {
+    return null;
+  }
 }
 
 async function requirePremiumTenant(req) {
@@ -142,9 +189,12 @@ async function requireManager(req, res) {
 async function publicDashboardPayload(guildId) {
   const cached = getMembersCache(guildId);
   if (cached?.payload && Date.now() - Number(cached.savedAt || 0) < cacheTtlMs()) {
-    return cached.payload;
+    const site = publicSite(getSite(guildId));
+    return { ...cached.payload, site, theme: site.theme || 'slate', slug: site.slug };
   }
-  const clubs = await hydrateClubTargets(guildId, listGuildDashboardClubs(guildId));
+  const clubs = await attachPromotionTargets(await applyDynamicDailyTargets(
+    await hydrateClubTargets(guildId, listGuildDashboardClubs(guildId)),
+  ));
   const built = [];
   for (const club of clubs) {
     try {
@@ -165,13 +215,14 @@ async function publicDashboardPayload(guildId) {
       });
     }
   }
+  const plannedClubs = withPlannedMemberCounts(built, getPlanning(guildId).assignments);
   const features = resolveFeatures(guildId);
   const applicants = features.applicants
     ? listGuildApplications(guildId)
       .filter((app) => app.publishPublicly !== false && ['pending', 'approved', 'waitlisted'].includes(app.status))
       .map(applicationToDashboard)
     : [];
-  const site = getSite(guildId);
+  const site = publicSite(getSite(guildId));
   const payload = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
@@ -182,20 +233,15 @@ async function publicDashboardPayload(guildId) {
     theme: site.theme || 'slate',
     premium: features.overview && (Boolean(site.premium) || isPremiumGuild(guildId)),
     features,
-    clubs: built,
+    clubs: plannedClubs,
     applicants,
   };
   await setMembersCache(guildId, payload);
   return payload;
 }
 
-function findCharacter(characterId) {
-  const id = String(characterId || '').trim();
-  if (!id) return null;
-  return { id, characterName: id.split(' - ').slice(1).join(' - ') || id };
-}
-
 export function mountDashboard(app) {
+  mountAdmin(app);
   const seedGuild = String(process.env.DASHBOARD_SEED_GUILD_ID || '').trim();
   if (seedGuild) {
     try {
@@ -221,10 +267,34 @@ export function mountDashboard(app) {
 
   api.get('/health', (_req, res) => res.json({ ok: true, dashboard: true }));
 
-  api.get('/public/tenants', (_req, res) => {
-    // Every network with a slug is publicly reachable; premium only unlocks features.
-    const tenants = listPublicTenants().filter((row) => Boolean(row.slug));
-    res.json({ tenants });
+  api.get('/public/tenants', async (_req, res) => {
+    try {
+      const known = new Map();
+      for (const row of listPublicTenants()) {
+        if (row.slug) known.set(String(row.guildId), row);
+      }
+      for (const guildId of listRegisteredGuildIds()) {
+        if (known.has(String(guildId))) continue;
+        const site = getSite(guildId);
+        known.set(String(guildId), {
+          guildId: String(guildId),
+          slug: site.slug || String(guildId),
+          siteName: site.siteName,
+        });
+      }
+      const tenants = [];
+      for (const row of known.values()) {
+        const guildName = genericSiteName(row.siteName) ? await lookupGuildName(row.guildId) : null;
+        tenants.push({
+          guildId: row.guildId,
+          slug: row.slug,
+          siteName: tenantLabel(row.siteName, guildName, row.slug),
+        });
+      }
+      res.json({ tenants });
+    } catch (error) {
+      jsonError(res, error);
+    }
   });
 
   api.get('/public/dashboard', async (req, res) => {
@@ -256,7 +326,13 @@ export function mountDashboard(app) {
       if (!/^\d+$/.test(umaId)) return res.status(400).json({ error: 'Uma ID must contain only digits.' });
       if (discordUsername.length < 2) return res.status(400).json({ error: 'Discord username is required.' });
       const clubs = listGuildDashboardClubs(guildId);
-      const club = clubs.find((item) => item.circleId === targetClubId);
+      const requested = Array.isArray(req.body?.targetClubIds) && req.body.targetClubIds.length
+        ? req.body.targetClubIds.map((id) => String(id))
+        : [targetClubId];
+      const selected = requested
+        .map((id) => clubs.find((item) => item.circleId === id))
+        .filter(Boolean);
+      const club = selected[0];
       if (!club) return res.status(400).json({ error: 'Selected club is not accepting applications.' });
       if (findBlacklistMatch(guildId, umaId, discordUsername)) {
         return res.status(403).json({ error: getSite(guildId).applyBlocked });
@@ -267,7 +343,7 @@ export function mountDashboard(app) {
       const record = existing
         ? patchApplication(id, {
           ign: profile.ign,
-          club: club.name,
+          club: selected.map((item) => item.name).join(', '),
           targetClubId: club.circleId,
           discordUsername,
           privateNotes: notes,
@@ -285,7 +361,7 @@ export function mountDashboard(app) {
           applicantId: null,
           ign: profile.ign,
           gameId: umaId,
-          club: club.name,
+          club: selected.map((item) => item.name).join(', '),
           reason: notes || null,
           discordUsername,
           privateNotes: notes,
@@ -293,6 +369,19 @@ export function mountDashboard(app) {
           ...profile,
           performanceSyncedAt: new Date().toISOString(),
         });
+      const webhook = getSite(guildId).applyWebhookUrl;
+      if (webhook) {
+        await notifyApplicationWebhook(webhook, {
+          ign: record.ign,
+          umaId: record.gameId,
+          discordUsername,
+          clubNames: selected.map((item) => item.name),
+          dailyAverage: record.dailyAverage,
+          monthlyGain: record.monthlyGain,
+          currentClubName: record.currentClubName,
+          notes,
+        });
+      }
       res.status(201).json({
         ok: true,
         applicant: {
@@ -514,21 +603,27 @@ export function mountDashboard(app) {
       const ctx = await requireManager(req, res);
       if (!ctx) return;
       if (req.query.profile) {
-        const profile = await resolveUmaProfile(String(req.query.profile));
+        const profile = await buildMemberProfile(ctx.guildId, String(req.query.profile));
         return res.json(profile);
       }
-      const clubs = await hydrateClubTargets(ctx.guildId, listGuildDashboardClubs(ctx.guildId));
+      const clubs = withLeaderboardChannels(ctx.guildId, await attachPromotionTargets(await applyDynamicDailyTargets(
+        await hydrateClubTargets(ctx.guildId, listGuildDashboardClubs(ctx.guildId)),
+      )));
+      const directoryIds = listMemberDirectory(ctx.guildId).map((row) => row.umaId);
+      await warmNetworkTenure(ctx.guildId, directoryIds);
+      const site = getSite(ctx.guildId);
       res.json({
         clubs,
         memberLinks: listMemberLinks(ctx.guildId),
         directory: listMemberDirectory(ctx.guildId),
         user: ctx.user,
-        theme: getSite(ctx.guildId).theme,
+        theme: site.theme,
+        applyWebhookUrl: site.applyWebhookUrl || '',
         staff: [
           ...(ctx.user.isOwner ? [{ discordId: ctx.user.discordId, label: ctx.user.label, source: 'owner', clubIds: ctx.user.clubIds }] : []),
           ...listStaffExtra(ctx.guildId).map((row) => ({ ...row, source: 'staff', clubIds: ctx.user.clubIds })),
         ],
-        site: getSite(ctx.guildId),
+        site,
       });
     } catch (error) {
       jsonError(res, error);
@@ -540,8 +635,39 @@ export function mountDashboard(app) {
       const ctx = await requireManager(req, res);
       if (!ctx) return;
       if (req.body?.site === true) {
-        const site = await saveSite(ctx.guildId, { theme: req.body.theme });
-        return res.json({ theme: site.theme });
+        const patch = {};
+        if (req.body.theme !== undefined) patch.theme = req.body.theme;
+        if (req.body.applyWebhookUrl !== undefined) {
+          const url = String(req.body.applyWebhookUrl || '').trim();
+          if (url && !isDiscordWebhookUrl(url)) {
+            return res.status(400).json({ error: 'Paste a Discord webhook URL from the applications channel.' });
+          }
+          patch.applyWebhookUrl = url;
+        }
+        const site = await saveSite(ctx.guildId, patch);
+        return res.json({ theme: site.theme, applyWebhookUrl: site.applyWebhookUrl || '' });
+      }
+      if (req.body?.leaderboard === true) {
+        const circleId = String(req.body.circleId || '');
+        const saved = updateGuildClubSettings(ctx.guildId, circleId, {
+          showTotal: req.body.showTotal !== false,
+          showAvg: req.body.showAvg !== false,
+          showToday: req.body.showToday !== false,
+        });
+        if (!saved) return res.status(404).json({ error: 'Club not found.' });
+        return res.json({
+          circleId,
+          showTotal: req.body.showTotal !== false,
+          showAvg: req.body.showAvg !== false,
+          showToday: req.body.showToday !== false,
+        });
+      }
+      if (req.body?.order === true && Array.isArray(req.body.circleIds)) {
+        await setClubOrder(ctx.guildId, req.body.circleIds);
+        const clubs = await applyDynamicDailyTargets(
+          await hydrateClubTargets(ctx.guildId, listGuildDashboardClubs(ctx.guildId)),
+        );
+        return res.json({ clubs });
       }
       if (req.body?.staff === true) {
         if (req.body.remove) {
@@ -558,11 +684,13 @@ export function mountDashboard(app) {
       const circleId = String(req.query.circleId || req.body.circleId || '');
       const settings = await upsertClubSettings(ctx.guildId, circleId, {
         dailyTarget: req.body.dailyTarget,
-        promotionRatio: req.body.promotionRatio,
         severeRatio: req.body.severeRatio,
         inactiveDays: req.body.inactiveDays,
         promotionEnabled: req.body.promotionEnabled,
+        dynamicRequirement: req.body.dynamicRequirement === true,
         rankGrade: req.body.rankGrade ?? null,
+        cardColor: req.body.cardColor || null,
+        cardColor2: req.body.cardColor2 || null,
         name: req.body.name,
       });
       res.json({ circleId, ...settings, name: req.body.name });
@@ -645,123 +773,6 @@ export function mountDashboard(app) {
     }
   });
 
-  api.get('/tournaments', async (req, res) => {
-    try {
-      const ctx = await requireManager(req, res);
-      if (!ctx) return;
-      const id = Number(req.query.id);
-      if (Number.isInteger(id) && id > 0) {
-        const board = getTournamentBoard(ctx.guildId, id);
-        if (!board) return res.status(404).json({ error: 'Tournament not found.' });
-        return res.json({ ...board, user: ctx.user });
-      }
-      res.json({ tournaments: listTournaments(ctx.guildId), user: ctx.user });
-    } catch (error) {
-      jsonError(res, error);
-    }
-  });
-
-  api.post('/tournaments', async (req, res) => {
-    try {
-      const ctx = await requireManager(req, res);
-      if (!ctx) return;
-      const tournament = await createTournament(ctx.guildId, req.body);
-      res.status(201).json(tournament);
-    } catch (error) {
-      jsonError(res, error);
-    }
-  });
-
-  api.put('/tournaments', async (req, res) => {
-    try {
-      const ctx = await requireManager(req, res);
-      if (!ctx) return;
-      const id = Number(req.query.id || req.body?.id);
-      if (req.query.roster === '1' || req.body?.roster === true) {
-        const players = await replaceTournamentRoster(ctx.guildId, id, req.body.players || []);
-        return res.json({ players });
-      }
-      const tournament = await updateTournament(ctx.guildId, id, req.body);
-      if (!tournament) return res.status(404).json({ error: 'Tournament not found.' });
-      res.json(tournament);
-    } catch (error) {
-      jsonError(res, error);
-    }
-  });
-
-  api.delete('/tournaments', async (req, res) => {
-    try {
-      const ctx = await requireManager(req, res);
-      if (!ctx) return;
-      const ok = await deleteTournament(ctx.guildId, req.query.id);
-      res.status(ok ? 204 : 404).end();
-    } catch (error) {
-      jsonError(res, error);
-    }
-  });
-
-  api.get('/tourney', async (req, res) => {
-    try {
-      const ctx = await requireUser(req, res);
-      if (!ctx) return;
-      const id = Number(req.query.id);
-      if (Number.isInteger(id) && id > 0) {
-        const board = getTournamentBoard(ctx.guildId, id);
-        if (!board) return res.status(404).json({ error: 'Tournament not found.' });
-        const onRoster = board.players.some((player) => player.discordId === ctx.user.discordId);
-        if (!ctx.user.isManager && !onRoster) {
-          return res.status(403).json({ error: 'You are not on this tournament roster.' });
-        }
-        return res.json({
-          ...board,
-          canEditAll: Boolean(ctx.user.isManager),
-          locked: board.tournament.locked,
-          user: ctx.user,
-        });
-      }
-      res.json({
-        tournaments: listTournamentsForUser(ctx.guildId, ctx.user.discordId, ctx.user.isManager),
-        user: ctx.user,
-      });
-    } catch (error) {
-      jsonError(res, error);
-    }
-  });
-
-  api.put('/tourney', async (req, res) => {
-    try {
-      const ctx = await requireUser(req, res);
-      if (!ctx) return;
-      const input = req.body || {};
-      const updatedBy = ctx.user.label || ctx.user.globalName || ctx.user.username;
-      if (input.characterId == null || input.characterId === '') {
-        await clearTournamentPick(ctx.guildId, {
-          tournamentId: input.tournamentId,
-          playerId: input.playerId,
-          round: input.round,
-          actorDiscordId: ctx.user.discordId,
-          isManager: Boolean(ctx.user.isManager),
-        });
-        return res.json({ ok: true, cleared: true });
-      }
-      const character = findCharacter(input.characterId);
-      if (!character) return res.status(400).json({ error: 'Unknown character selection.' });
-      const pick = await saveTournamentPick(ctx.guildId, {
-        tournamentId: input.tournamentId,
-        playerId: input.playerId,
-        round: input.round,
-        characterId: character.id,
-        characterName: character.characterName,
-        updatedBy,
-        actorDiscordId: ctx.user.discordId,
-        isManager: Boolean(ctx.user.isManager),
-      });
-      res.json({ ok: true, pick: { ...pick, label: character.characterName } });
-    } catch (error) {
-      jsonError(res, error);
-    }
-  });
-
   app.use('/api', api);
 
   const distCandidates = [
@@ -769,18 +780,18 @@ export function mountDashboard(app) {
     path.resolve(__dirname, '../../UmaClubDashboard/dist'),
   ];
   const RESERVED_ROOT_SEGMENTS = new Set([
-    'api', 'assets', 'g', 'staff', 'apply', 'tourney', 'interactions',
+    'api', 'assets', 'g', 'staff', 'apply', 'tourney', 'interactions', 'admin',
   ]);
   const dist = distCandidates.find((dir) => fs.existsSync(path.join(dir, 'index.html')));
   if (dist) {
     app.use(express.static(dist));
-    app.get(['/g/:tenant', '/staff', '/tourney', '/apply'], (_req, res) => {
+    app.get(['/g/:tenant', '/staff', '/tourney', '/apply', '/admin', '/admin/*'], (_req, res) => {
       res.sendFile(path.join(dist, 'index.html'));
     });
     app.use((req, res, next) => {
       if (req.method !== 'GET') return next();
       if (req.path.startsWith('/api') || req.path.startsWith('/assets') || req.path === '/interactions') return next();
-      if (req.path.startsWith('/g/')) {
+      if (req.path.startsWith('/g/') || req.path === '/admin' || req.path.startsWith('/admin/')) {
         return res.sendFile(path.join(dist, 'index.html'));
       }
       // Root-level network slug, e.g. /bunny. Reserved words always win, so
@@ -795,6 +806,9 @@ export function mountDashboard(app) {
   } else {
     app.get(['/g/:tenant', '/g/:tenant/*', '/:slug'], (req, res) => {
       const ref = req.params.tenant || req.params.slug;
+      if (ref === 'admin') {
+        return res.type('html').send('<p>Build the dashboard frontend into <code>web/dashboard</code> to use /admin.</p>');
+      }
       const guildId = resolveGuildRef(ref);
       if (!guildId) return res.status(404).send('Unknown dashboard.');
       res.type('html').send(`<!doctype html><meta charset="utf-8"><title>Tazuna dashboard</title>
